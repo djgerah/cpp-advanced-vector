@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <new>
@@ -193,18 +194,19 @@ class Vector
                 }
 
                 else 
-                {
+                {   
+                    size_t min_size = std::min(size_, other.size_);
+                    std::copy_n(other.begin(), min_size, begin());
+
                     if (other.size_ < size_) 
                     {
                         // Если размер other меньше размера this, необходимо скопировать элементы из other и удалить существующие, которые не нужны
-                        std::copy(other.begin(), other.end(), begin());
                         std::destroy_n(begin() + other.size_, size_ - other.size_);
                     } 
                     
                     else 
                     {
                         // Если размер other больше размера this, необходимо скопировать элементы из other и проинициализировать новые    
-                        std::copy(other.begin(), other.data_ + size_, begin());
                         std::uninitialized_copy_n(other.data_ + size_, other.size_ - size_, data_ + size_);
                     }
 
@@ -397,33 +399,8 @@ class Vector
         переданного элемента, он конструируется путём передачи параметров метода конструктору T
     */
 
-        if (size_ == data_.Capacity()) 
-        {
-            RawMemory<T> new_data{size_ == 0 ? 1 : size_ * 2};
-            new (new_data + size_) T{std::forward<Args>(args)...};
+        Emplace(end(), std::forward<Args>(args)...);
 
-            // Если у типа T нет конструктора копирования и move-конструктор может выбрасывать исключения, 
-            // метод EmplaceBack должен предоставлять базовую гарантию безопасности исключений
-            if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>)
-            {
-                std::uninitialized_move_n(begin(), size_, new_data.GetAddress());
-            }
-
-            else 
-            {
-                std::uninitialized_copy_n(begin(), size_, new_data.GetAddress());
-            }
-
-            std::destroy_n(begin(), size_);
-            data_.Swap(new_data);
-        } 
-        
-        else 
-        {
-            new (data_ + size_) T{std::forward<Args>(args)...};
-        }
-
-        ++size_;
         return data_[size_ - 1];
     }
 
@@ -440,62 +417,70 @@ class Vector
         return Emplace(pos, std::move(value));
     }
 
-    template<typename... Args>
-    iterator Emplace(const_iterator pos, Args&&... args) 
-    {
-        size_t index = std::distance(cbegin(), pos); // Итератор pos указывает на позицию вставки элемента
-        // Вектор имеет достаточную вместимость для вставки ещё одного элемента.
-        if (size_ < data_.Capacity()) 
+    template<typename... Args> 
+    iterator Emplace(const_iterator pos, Args&&... args)  
+    { 
+        size_t index = std::distance(cbegin(), pos); // Итератор pos указывает на позицию вставки элемента 
+        // Если вектор имеет достаточную вместимость для вставки ещё одного элемента 
+        if (size_ < data_.Capacity())  
         {
-            if (pos == end()) 
-            {
-                return &EmplaceBack(std::forward<Args>(args)...);
-            }
-
-            // Сначала значение копируется или перемещается во временный объект
-            T temp{std::forward<Args>(args)...};
-            // Прежде чем вставить элемент в середину вектора, для него освобождается место. 
-            // Сначала в неинициализированной области, следующей за последним элементом, 
-            // создается копия или перемещается значение последнего элемента вектора
-            new (end()) T{std::move(data_[size_ - 1])};
-            // Затем перемещаются элементы диапазона [pos, end() - 1) вправо на один элемент.
-            // Для сдвига элементов вправо используется функция move_backward. Она перемещает объекты, начиная с последнего
-            std::move_backward(begin() + index, end() - 1, end());
-            // После перемещения элементов временное значение перемещается во вставляемую позицию
-            data_[index] = std::move(temp);
+            // Реаллокация не требуется
+            NoRealloc(index, std::forward<Args>(args)...);
         } 
-
-        // Вектор полностью заполнен. В результате вставка элемента приведёт к реаллокации памяти.
+        // Иначе
         else 
         {   
-            // На первом шаге нужно выделить новый блок сырой памяти с удвоенной вместимостью (если size != 0)
-            // Затем сконструировать в ней вставляемый элемент, используя конструктор копирования или перемещения
-            RawMemory<T> new_data{size_ == 0 ? 1 : size_ * 2};
-            new (new_data + index) T{std::forward<Args>(args)...};
-
-            // Вставляемый элемент конструируется в новом блоке памяти до конструирования остальных элементов.
-            // Затем перемещаются либо копируются элементы, которые предшествуют вставленному элементу:
-            if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>) 
-            {
-                std::uninitialized_move_n(begin() + index, size_ - index, new_data.GetAddress() + index + 1);
-                std::uninitialized_move_n(begin(), index, new_data.GetAddress());
-            } 
-
-            else 
-            {
-                std::uninitialized_copy_n(begin() + index, size_ - index, new_data.GetAddress() + index + 1);
-                std::uninitialized_copy_n(begin(), index, new_data.GetAddress());
-            }
-
-            std::destroy_n(begin(), size_ - index);
-            data_.Swap(new_data);
+            // Необходима реаллокация
+            Realloc(index, std::forward<Args>(args)...);
         }
 
-        // В конце остаётся обновить размер вектора и вернуть итератор, указывающий на вставленный элемент
-        size_++;
+        // В конце остаётся обновить размер вектора и вернуть итератор, указывающий на вставленный элемент 
+        size_++; 
+ 
+        return data_ + index; 
+    } 
 
-        return data_ + index;
+    template<typename... Args>
+    void NoRealloc(size_t index, Args&&... args) 
+    {
+        // Сначала значение копируется или перемещается во временный объект 
+        T temp{std::forward<Args>(args)...}; 
+        // Прежде чем вставить элемент в середину вектора, для него освобождается место.  
+        // Сначала в неинициализированной области, следующей за последним элементом,  
+        // создается копия или перемещается значение последнего элемента вектора 
+        new (end()) T{std::move(data_[size_ - 1])}; 
+        // Затем перемещаются элементы диапазона [pos, end() - 1) вправо на один элемент. 
+        // Для сдвига элементов вправо используется функция move_backward. Она перемещает объекты, начиная с последнего 
+        std::move_backward(begin() + index, end() - 1, end()); 
+        // После перемещения элементов временное значение перемещается во вставляемую позицию 
+        data_[index] = std::move(temp); 
     }
+
+    template<typename... Args>
+    void Realloc(size_t index, Args&&... args) 
+    {    
+        // На первом шаге нужно выделить новый блок сырой памяти с удвоенной вместимостью (если size != 0) 
+        // Затем сконструировать в ней вставляемый элемент, используя конструктор копирования или перемещения 
+        RawMemory<T> new_data{size_ == 0 ? 1 : size_ * 2}; 
+        new (new_data + index) T{std::forward<Args>(args)...}; 
+
+        // Вставляемый элемент конструируется в новом блоке памяти до конструирования остальных элементов. 
+        // Затем перемещаются либо копируются элементы, которые предшествуют вставленному элементу: 
+        if constexpr (std::is_nothrow_move_constructible_v<T> || !std::is_copy_constructible_v<T>)  
+        { 
+            std::uninitialized_move_n(begin() + index, size_ - index, new_data.GetAddress() + index + 1); 
+            std::uninitialized_move_n(begin(), index, new_data.GetAddress()); 
+        }  
+
+        else  
+        { 
+            std::uninitialized_copy_n(begin() + index, size_ - index, new_data.GetAddress() + index + 1); 
+            std::uninitialized_copy_n(begin(), index, new_data.GetAddress()); 
+        } 
+
+        std::destroy_n(begin(), size_ - index); 
+        data_.Swap(new_data); 
+    } 
 
     // Метод Erase удаляет элемент, на который указывает переданный итератор
     iterator Erase(const_iterator pos) noexcept(std::is_nothrow_move_assignable_v<T>)
